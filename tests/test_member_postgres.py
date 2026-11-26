@@ -58,3 +58,23 @@ class PostgresMemberTests(unittest.IsolatedAsyncioTestCase):
         values=await self.pool.fetch('SELECT balance,available FROM accounts ORDER BY id')
         self.assertEqual([r['balance'] for r in values],[Decimal('20.00'),Decimal('85.00')])
         self.assertEqual(await self.pool.fetchval('SELECT COUNT(*) FROM transactions'),1)
+
+    async def test_explicit_pin_migration_and_database_constraint(self):
+        import asyncpg
+        from migrate_member_pins import convert
+        from pin_credentials import verify_pin
+        async with self.pool.acquire() as connection:
+            # Reproduce a pre-migration PIN row in this test's disposable schema only.
+            await connection.execute('ALTER TABLE secrets DROP CONSTRAINT member_pin_hash')
+            await connection.execute("UPDATE secrets SET secret=$1 WHERE type='pin' AND account_id=1", PIN)
+            await connection.execute((Path(__file__).resolve().parents[1]/'srv/data/member-services.sql').read_text())
+            self.assertEqual(await convert(connection), 1)
+            digest = await connection.fetchval("SELECT secret FROM secrets WHERE type='pin' AND account_id=1")
+            self.assertNotEqual(digest, PIN)
+            self.assertTrue(verify_pin(PIN, digest))
+            self.assertEqual(await convert(connection), 0)
+            with self.assertRaises(asyncpg.CheckViolationError):
+                await connection.execute("UPDATE secrets SET secret=$1 WHERE type='pin' AND account_id=1", PIN)
+            with self.assertRaises(asyncpg.CheckViolationError):
+                await connection.execute("INSERT INTO transactions(debit_account,credit_account,amount,type,description) "
+                                         "VALUES(1,2,1.00,'member_transfer',$1)", f'{CARD}=fixture')

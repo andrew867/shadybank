@@ -14,13 +14,15 @@ dd1 varchar(31), dd2 numeric(31), status card_status, constraint fk_account_id f
 create type secrets_type as enum ('pin', 'password', 'totp', 'webauthn', 'shopt');
 
 create table secrets (id serial primary key, account_id int, type secrets_type, secret text, created_at timestamp 
-not null default NOW(), last_used timestamp, constraint fk_account_id foreign key (account_id) references accounts(id));
+not null default NOW(), last_used timestamp, constraint fk_account_id foreign key (account_id) references accounts(id),
+constraint member_pin_hash check (type <> 'pin' or (secret is not null and secret like '$argon2%')));
 
 create type trans_type as enum ('credit_points', 'purchase', 'refund', 'member_transfer');
 
 create table transactions (id serial primary key, timestamp timestamp not null default NOW(), debit_account integer not null, credit_account 
 integer not null, amount numeric(8,2) not null, pan varchar(19), auth_code varchar(6), type trans_type not null, related_transaction int,
-description text, constraint fk_debit_aid foreign key (debit_account) references accounts(id),
+description text, constraint transaction_description_no_track check (description is null or description !~* '(B[0-9]{8,19}\^|[0-9]{8,19}=)'),
+constraint fk_debit_aid foreign key (debit_account) references accounts(id),
 constraint fk_credit_aid foreign key (credit_account) references accounts(id));
 
 create table member_transfers (

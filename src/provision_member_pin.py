@@ -4,9 +4,8 @@ import asyncio
 import getpass
 
 import asyncpg
-from passlib.hash import argon2
-
 from member_api import PAN, PIN, active_card, ordinary
+from pin_credentials import hash_pin
 
 
 async def provision(pan, pin):
@@ -18,7 +17,7 @@ async def provision(pan, pin):
                 'FROM cards c JOIN accounts a ON a.id=c.account_id WHERE c.pan=$1 FOR UPDATE OF a,c',pan)
             if not ordinary(card) or not active_card(card):
                 raise ValueError('Eligible member card required')
-            digest = await asyncio.get_running_loop().run_in_executor(None, argon2.hash, pin)
+            digest = await asyncio.get_running_loop().run_in_executor(None, hash_pin, pin)
             await db.execute("DELETE FROM secrets WHERE account_id=$1 AND type='pin'",card['account_id'])
             await db.execute("INSERT INTO secrets(account_id,type,secret) VALUES($1,'pin',$2)",card['account_id'],digest)
     finally:

@@ -11,7 +11,6 @@ import json
 from passlib.hash import argon2
 import pyotp
 import os
-import re
 import secrets
 from Crypto.Cipher import DES3
 from Crypto.Random import get_random_bytes
@@ -21,34 +20,8 @@ from onelogin.saml2.auth import OneLogin_Saml2_Auth
 
 from saml_support import SAML_SESSION_TTL, load_saml_settings, prepare_saml_request, saml_attribute_name
 from member_api import MemberAPI
-
-track1_re = re.compile(r'(?a)%B(?P<pan>\d{8,19})\^(?P<name>.*)\^(?P<exp>\d{4})(?P<svc>\d{3})(?P<dd1>.*?)\?')
-track2_re = re.compile(r'(?a);(?P<pan>\d{8,19})=(?P<exp>\d{4})(?P<svc>\d{3})(?P<dd2>.*?)\?')
-
-def parse_track1(track):
-    m = track1_re.search(track)
-    if not m:
-        return None
-    return {
-        'track': 1,
-        'pan': m.group('pan'),
-        'name': m.group('name'),
-        'exp': m.group('exp'),
-        'svc': m.group('svc'),
-        'dd1': m.group('dd1')
-    }
-
-def parse_track2(track):
-    m = track2_re.search(track)
-    if not m:
-        return None
-    return {
-        'track': 2,
-        'pan': m.group('pan'),
-        'exp': m.group('exp'),
-        'svc': m.group('svc'),
-        'dd2': m.group('dd2')
-    }
+from card_inputs import (has_track_input, merchant_description, resolve_legacy_card,
+                         reject_portal_pin_or_track, redact_track_description)
 
 class ShadyBucksAPIDaemon:
     def __init__(self, **kwargs):
@@ -93,7 +66,8 @@ class ShadyBucksAPIDaemon:
 
     def run(self, path):
         asyncio.get_event_loop().run_until_complete(self._init_db_pool())
-        web.run_app(self._app, path=path)
+        # Log outcomes and timing, not request URLs/queries or submitted card data.
+        web.run_app(self._app, path=path, access_log_format='%s %Tf')
         
     async def handle_login_success(self, request, auth_row):
         auth_token = secrets.token_urlsafe()
@@ -250,11 +224,9 @@ class ShadyBucksAPIDaemon:
         args = await request.post()
         auth_rows = None
 
-        if ('magstripe' in args and len(args['magstripe'])) or \
-            ('track1' in args and len(args['track1'])) or \
-            ('track2' in args and len(args['track2'])):
-            card_data = self._get_account_from_magstripe(args)
-            args['pan'] = card_data['card']['pan']
+        # PINs are exclusively for the short-lived, member-scoped API. They must
+        # never be interpreted as a web or merchant password.
+        reject_portal_pin_or_track(args)
 
         if 'pan' in args:
             auth_rows = await self._psql_pool.fetch('SELECT s.account_id, s.id, s.type, s.secret ' \
@@ -273,9 +245,6 @@ class ShadyBucksAPIDaemon:
             for auth_row in auth_rows:
                 if 'password' in args and len(args['password']) and auth_row['type'] == 'password':
                     if argon2.verify(args['password'], auth_row['secret']):
-                        return await self.handle_login_success(request, auth_row)
-                if 'pin' in args and len(args['pin']) and auth_row['type'] == 'password':
-                    if args['pin'] == auth_row['secret']:
                         return await self.handle_login_success(request, auth_row)
                 if 'otp' in args and len(args['otp']) and auth_row['type'] == 'totp':
                     # Try Google Authenticator codes first, which ignore the interval we specify
@@ -327,11 +296,11 @@ class ShadyBucksAPIDaemon:
             if transaction['debit_account'] == acct:
                 transactions.append({ 'timestamp': str(transaction['timestamp']), 'amount': float(transaction['amount']),
                     'type': 'debit', 'subtype': transaction['type'], 'counterparty': transaction['cname'], 
-                    'auth_code': transaction['auth_code'], 'description': transaction['description'] or '' })
+                    'auth_code': transaction['auth_code'], 'description': redact_track_description(transaction['description']) })
             else:
                 transactions.append({ 'timestamp': str(transaction['timestamp']), 'amount': float(transaction['amount']),
                     'type': 'credit', 'subtype': transaction['type'], 'counterparty': transaction['dname'], 
-                    'auth_code': transaction['auth_code'], 'description': transaction['description'] or ''})
+                    'auth_code': transaction['auth_code'], 'description': redact_track_description(transaction['description'])})
         return web.json_response(transactions)
 
     async def get_authorizations(self, request):
@@ -353,31 +322,8 @@ class ShadyBucksAPIDaemon:
                     'auth_code': authorization['auth_code'] })
         return web.json_response(authorizations)
 
-    async def _get_account_from_magstripe(self, args):
-        card_data = None
-
-        if 'magstripe' in args:
-            card_data = parse_track1(args['magstripe'])
-            if not card_data:
-                card_data = parse_track2(args['magstripe'])
-        elif 'track1' in args:
-            card_data = parse_track1(args['track1'])
-        elif 'track2' in args:
-            card_data = parse_track2(args['track2'])
-
-        if not card_data:
-            raise web.HTTPBadRequest()
-
-        card_row = await self._psql_pool.fetchrow('SELECT * FROM cards WHERE pan = $1 AND expires = $2',
-            card_data['pan'], card_data['exp'])
-        if not card_row:
-            raise web.HTTPNotFound()
-        if card_data['track'] == 1 and card_data['dd1'] == card_row['dd1']:
-            return { 'account': card_row['account_id'], 'status': card_row['status'], 'card': card_data }
-        elif card_data['track'] == 2 and card_data['dd2'] == str(card_row['dd2']):
-            return { 'account': card_row['account_id'], 'status': card_row['status'], 'card': card_data }
-        else:
-            raise web.HTTPNotFound()
+    async def _get_account_from_magstripe(self, args, *, issuance=False):
+        return await resolve_legacy_card(args, self._psql_pool, issuance=issuance)
 
     async def _get_account_from_wristband(self, args):
         uid = None
@@ -412,9 +358,7 @@ class ShadyBucksAPIDaemon:
 
         card_data = {}
 
-        if ('magstripe' in args and len(args['magstripe'])) or \
-            ('track1' in args and len(args['track1'])) or \
-            ('track2' in args and len(args['track2'])):
+        if has_track_input(args):
             card_data = await self._get_account_from_magstripe(args)
         elif ('nfc_token' in args and len(args['nfc_token'])):
             card_data = await self._get_account_from_wristband(args)
@@ -473,6 +417,7 @@ class ShadyBucksAPIDaemon:
 
     async def post_capture(self, request):
         args = await request.post()
+        description = merchant_description(args)
         if (not 'amount' in args) or (not 'auth_code' in args):
             raise web.HTTPBadRequest()
         amount = round(float(args['amount']), 2)
@@ -495,10 +440,6 @@ class ShadyBucksAPIDaemon:
                 await con.execute('UPDATE accounts SET balance = balance + $1, ' \
                     'available = available + $1, last_updated = NOW() WHERE id = $2',
                     amount, auth_row['credit_account'])
-                if 'description' in args:
-                    description = args['description']
-                else:
-                    description = None
                 await con.execute('INSERT INTO transactions (debit_account, credit_account, amount, pan, auth_code, ' \
                     'type, description) VALUES($1, $2, $3, $4, $5, $6, $7)', auth_row['debit_account'],
                     auth_row['credit_account'], amount, auth_row['pan'], args['auth_code'], "purchase", description)
@@ -523,6 +464,7 @@ class ShadyBucksAPIDaemon:
 
     async def post_reverse(self, request):
         args = await request.post()
+        description = merchant_description(args)
         if (not 'auth_code' in args):
             raise web.HTTPBadRequest()
         merchant_data = await self._get_account_data(await self._get_auth_account(request))
@@ -546,10 +488,6 @@ class ShadyBucksAPIDaemon:
                 await con.execute('UPDATE accounts SET balance = balance - $1, ' \
                     'available = available - $1, last_updated = NOW() WHERE id = $2',
                     transaction_row['amount'], transaction_row['credit_account'])
-                if 'description' in args:
-                    description = args['description']
-                else:
-                    description = None
                 await con.execute('INSERT INTO transactions (debit_account, credit_account, amount, pan, ' \
                     'related_transaction, type, description) VALUES($1, $2, $3, $4, $5, $6, $7)',
                     transaction_row['credit_account'], transaction_row['debit_account'], transaction_row['amount'],
@@ -558,6 +496,7 @@ class ShadyBucksAPIDaemon:
 
     async def post_credit(self, request):
         args = await request.post()
+        description = merchant_description(args)
         if not 'amount' in args:
             raise web.HTTPBadRequest()
         amount = round(float(args['amount']), 2)
@@ -567,9 +506,7 @@ class ShadyBucksAPIDaemon:
 
         card_data = {}
 
-        if ('magstripe' in args and len(args['magstripe'])) or \
-            ('track1' in args and len(args['track1'])) or \
-            ('track2' in args and len(args['track2'])):
+        if has_track_input(args):
             card_data = await self._get_account_from_magstripe(args)
         elif ('nfc_token' in args and len(args['nfc_token'])):
             card_data = await self._get_account_from_wristband(args)
@@ -594,10 +531,6 @@ class ShadyBucksAPIDaemon:
                 await con.execute('UPDATE accounts SET balance = balance + $1, ' \
                     'available = available + $1, last_updated = NOW() WHERE id = $2',
                     amount, cust_id)
-                if 'description' in args:
-                    description = args['description']
-                else:
-                    description = None
                 await con.execute('INSERT INTO transactions (debit_account, credit_account, amount, pan, ' \
                     'type, description) VALUES($1, $2, $3, $4, $5, $6)', merchant_id,
                     cust_id, amount, card_data['card']['pan'], "credit_points", description)
@@ -783,7 +716,7 @@ class ShadyBucksAPIDaemon:
         merchant_data = await self._get_account_data(await self._get_auth_account(request))
         if not merchant_data['admin']:
             raise web.HTTPForbidden()
-        card_data = await self._get_account_from_magstripe(args)
+        card_data = await self._get_account_from_magstripe(args, issuance=True)
         dd1 = base64.b32encode(secrets.token_bytes(5)).decode('utf-8')
         dd2 = secrets.randbelow(100000000)
         await self._psql_pool.execute('UPDATE accounts SET name = $2 WHERE id = $1',
@@ -794,7 +727,7 @@ class ShadyBucksAPIDaemon:
             'track1': 'B' + str(card_data['card']['pan']) + '^' + name + '^' + \
             str(card_data['card']['exp']) + '101' + str(card_data['card']['dd1']) + dd1,
             'track2': str(card_data['card']['pan']) + '=' + str(card_data['card']['exp']) + \
-            '101' + str(dd2) })
+            '101' + str(dd2) }, headers={'Cache-Control': 'no-store'})
 
 def main():
     arg_parser = argparse.ArgumentParser(description='ShadyBucks API server')

@@ -13,10 +13,11 @@ from decimal import Decimal
 
 from aiohttp import web
 from passlib.hash import argon2
+from card_inputs import TRACK_TEXT
+from pin_credentials import PIN, is_pin_hash, verify_pin
 
 
 PAN = re.compile(r'[0-9]{8,19}')
-PIN = re.compile(r'[0-9]{4,8}')
 AMOUNT = re.compile(r'(?:0|[1-9][0-9]{0,5})\.[0-9]{2}')
 TOKEN = re.compile(r'[A-Za-z0-9_-]{43}')
 TTL = 300
@@ -52,7 +53,8 @@ def fixed(value):
 
 
 def safe_label(value, limit=100):
-    return ' '.join(str(value or '').split())[:limit]
+    text = ' '.join(str(value or '').split())
+    return '' if TRACK_TEXT.search(text) else text[:limit]
 
 
 class MemberAPI:
@@ -119,12 +121,9 @@ class MemberAPI:
         rows = await self.db.fetch(
             "SELECT id,secret FROM secrets WHERE account_id=$1 AND type='pin' ORDER BY id DESC LIMIT 2",
             card['account_id']) if eligible else []
-        row = rows[0] if len(rows) == 1 and str(rows[0]['secret']).startswith('$argon2') else None
+        row = rows[0] if len(rows) == 1 and is_pin_hash(rows[0]['secret']) else None
         digest = row['secret'] if row else self.dummy
-        try:
-            verified = await asyncio.get_running_loop().run_in_executor(None, argon2.verify, pin, digest)
-        except (ValueError, TypeError):
-            verified = False
+        verified = await asyncio.get_running_loop().run_in_executor(None, verify_pin, pin, digest)
         if not eligible or not row or not verified:
             raise self.unauthorized()
         token = secrets.token_urlsafe(32)

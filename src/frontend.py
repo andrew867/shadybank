@@ -44,7 +44,7 @@ class ShadyBucksFrontEndDaemon:
 
     def run(self, path):
         asyncio.get_event_loop().run_until_complete(self._init_pools())
-        web.run_app(self._app, path=path)
+        web.run_app(self._app, path=path, access_log_format='%s %Tf')
 
     @web.middleware    
     async def ensure_session_cookie(self, request, handler):
@@ -284,7 +284,9 @@ class ShadyBucksFrontEndDaemon:
                 { 'message': 'Backend said ' + str(act_resp.status),
                   'back_url': 'activate',
                   'back_text': 'Go back' })    
-        return aiohttp_jinja2.render_template('activate-result.html', request, await act_resp.json())
+        response = aiohttp_jinja2.render_template('activate-result.html', request, await act_resp.json())
+        response.headers['Cache-Control'] = 'no-store'
+        return response
 
     async def get_app_login(self, request, failed = False):
         context = { 'CSRF_TOKEN': request['CSRF_TOKEN'], 'failed': failed }

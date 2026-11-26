@@ -145,6 +145,15 @@ class MemberTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(web.HTTPUnauthorized):
             await self.api.login(request({'pan':RECIPIENT,'pin':PIN}))
 
+    async def test_plaintext_pin_and_unknown_card_have_same_rejection(self):
+        self.db.pins[1]['secret'] = PIN
+        errors = []
+        for pan in (CARD, '9000000000000099'):
+            with self.assertRaises(web.HTTPUnauthorized) as raised:
+                await self.api.login(request({'pan':pan,'pin':PIN}))
+            errors.append((raised.exception.status, raised.exception.text))
+        self.assertEqual(errors[0], errors[1])
+
     async def test_transfer_idempotence_and_limits(self):
         token=await self.token()
         form={'recipient_pan':RECIPIENT,'amount':'12.50','request_id':str(uuid4())}
