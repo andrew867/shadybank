@@ -1,40 +1,28 @@
 @font-face {
 	font-family: "Eurostile T";
-	font-weight: bold;
-	src: url("//shady.tel/fonts/EurostileTBla.eot");
-	src: local("â˜º"),
-		url("//shady.tel/fonts/EurostileTBla.woff") format("woff"),
-		url("//shady.tel/fonts/EurostileTBla.ttf") format("truetype"),
-		url("//shady.tel/fonts/EurostileTBla.svg") format("svg");
+	font-weight: 700;
+	font-display: swap;
+	src: url("fonts/EurostileTBla.woff") format("woff");
 }
 
 @font-face {
 	font-family: "Eurostile T";
-	font-weight: medium;
-	src: url("//shady.tel/fonts/EurostileT.eot");
-	src: local("â˜º"),
-		url("//shady.tel/fonts/EurostileT.woff") format("woff"),
-		url("//shady.tel/fonts/EurostileT.ttf") format("truetype"),
-		url("//shady.tel/fonts/EurostileT.svg") format("svg");
+	font-weight: 400;
+	font-display: swap;
+	src: url("fonts/EurostileT.woff") format("woff");
 }
 @font-face {
   font-family: "Bell Gothic";
-  font-weight: medium;
-  src: url("//shady.tel/fonts/bellgothic.eot");
-  src: local("â˜º"),
-    url("//shady.tel/fonts/bellgothic.woff") format("woff"),
-    url("//shady.tel/fonts/bellgothic.otf") format("opentype"),
-    url("//shady.tel/fonts/bellgothic.svg#filename") format("svg");
-  }
+  font-weight: 400;
+  font-display: swap;
+  src: url("fonts/bellgothic.woff") format("woff");
+}
 @font-face {
   font-family: "Bell Gothic";
-  font-weight: bold;
-  src: url("//shady.tel/fonts/bellgothic-black.eot");
-  src: local("â˜º"),
-    url("//shady.tel/fonts/bellgothic-black.woff") format("woff"),
-    url("//shady.tel/fonts/bellgothic-black.otf") format("opentype"),
-    url("//shady.tel/fonts/bellgothic-black.svg#filename-ital") format("svg");
-  }
+  font-weight: 700;
+  font-display: swap;
+  src: url("fonts/bellgothic-black.woff") format("woff");
+}
 
 
 .product {
@@ -44,19 +32,19 @@
 	margin-bottom: 8mm;
 }
 .product-title {
-	font-family: "Eurostile T";
+	font-family: "Eurostile T", sans-serif;
 	font-weight: bold;
 	font-size: 150%;
 }
 .product-price {
-	font-family: "Eurostile T";
+	font-family: "Eurostile T", sans-serif;
 	font-weight: bold;
 	font-size: 120%;
 }
 .align-cart { float: right; }
 h1 {	height: 0.5in;
 	background: #F5B71B;
-	font-family: "Eurostile T";
+	font-family: "Eurostile T", sans-serif;
 	border-bottom: 0.5em solid #1F6FB0;
 }
 .logo {	margin-left: 0.5em;
@@ -66,8 +54,8 @@ h1 {	height: 0.5in;
 	height: 1in;
 }
 h2, h3 {
-	font-family: "Eurostile T";
-	font-weight: medium;
+	font-family: "Eurostile T", sans-serif;
+	font-weight: 400;
 }
 h2 {	font-size: 225%; }
 h3 {	font-size: 150%; }
@@ -81,7 +69,7 @@ div.body {
 	padding-top: 0;
 	max-width: 8in;
 }
-p {	font-family: "Bell Gothic"; }
+p {	font-family: "Bell Gothic", sans-serif; }
 img.product-image {
 	float: left;
 }
