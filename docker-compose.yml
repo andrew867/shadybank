@@ -47,5 +47,24 @@ services:
       timeout: 10s
       retries: 5
       start_period: 30s
+  merchant-endpoint:
+    profiles: ["merchant"]
+    build:
+      context: .
+      dockerfile: ./Dockerfile.api
+    command: ["python", "src/merchant_service.py"]
+    environment:
+      SHADYBANK_MERCHANT_SERVICE_KEY: ${SHADYBANK_MERCHANT_SERVICE_KEY:-}
+      SHADYBANK_MERCHANT_ACCOUNT_ID: ${SHADYBANK_MERCHANT_ACCOUNT_ID:-}
+      PGHOST: db
+      PGUSER: shadybucks
+      PGPASSWORD: ${SHADYBANK_DB_PASSWORD:?Set SHADYBANK_DB_PASSWORD in .env}
+    ports:
+      - "127.0.0.1:8022:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 volumes:
   shadybucks-db:
