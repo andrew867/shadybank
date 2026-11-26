@@ -14,9 +14,10 @@ services:
       dockerfile: ./Dockerfile.api
     environment:
       SHADYBANK_MEMBER_SERVICE_KEY: ${SHADYBANK_MEMBER_SERVICE_KEY:-}
+      SHADYBANK_ALLOW_LEGACY_TRACKS: ${SHADYBANK_ALLOW_LEGACY_TRACKS:-1}
       PGHOST: db
       PGUSER: shadybucks
-      PGPASSWORD: N9aj8vtIaaYsAY52gdSXjOdgdzY8BTiN
+      PGPASSWORD: ${SHADYBANK_DB_PASSWORD:?Set SHADYBANK_DB_PASSWORD in .env}
     ports:
       - "127.0.0.1:8021:8080"
     depends_on:
@@ -28,7 +29,7 @@ services:
     image: postgres
     environment:
       POSTGRES_USER: shadybucks
-      POSTGRES_PASSWORD: N9aj8vtIaaYsAY52gdSXjOdgdzY8BTiN
+      POSTGRES_PASSWORD: ${SHADYBANK_DB_PASSWORD:?Set SHADYBANK_DB_PASSWORD in .env}
       POSTGRES_DB: shadybucks
     volumes:
       - ./srv/data/postgres.sql:/docker-entrypoint-initdb.d/00-create_db.sql
