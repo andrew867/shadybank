@@ -31,6 +31,11 @@ class MerchantService:
         try:
             await self._psql_pool.fetchval('SELECT 1')
             await self._redis_pool.ping()
+            if self.merchant.capture_enabled and not await self._psql_pool.fetchval(
+                    "SELECT to_regclass('merchant_capture_requests') IS NOT NULL AND EXISTS("
+                    "SELECT 1 FROM pg_index WHERE indexrelid=to_regclass('transactions_purchase_authorization_once') "
+                    "AND indisvalid AND indisunique)"):
+                raise RuntimeError('Capture schema is unavailable')
         except Exception:
             raise web.HTTPServiceUnavailable(text='Merchant service unavailable') from None
         return web.json_response({'status': 'healthy'})

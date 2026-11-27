@@ -14,6 +14,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from merchant_api import MerchantAPI, instrument_digest
+from merchant_capture import lock_pending_authorization, post_locked_capture
 
 
 KEY = 'synthetic-merchant-service-key-for-tests-only'
@@ -33,6 +34,16 @@ class MerchantConfigurationTests(unittest.IsolatedAsyncioTestCase):
                 MerchantAPI(SimpleNamespace(_app=app))
             async with TestClient(TestServer(app)) as client:
                 response = await client.post('/api/merchant/authorize', json={}, headers={'X-Shadybank-Merchant-Key':'wrong'})
+                self.assertEqual(response.status, expected)
+
+    async def test_capture_requires_independent_opt_in_and_merchant_authentication(self):
+        for enabled, key, expected in (('0', KEY, 503), ('1', 'wrong', 401)):
+            app = web.Application()
+            with patch.dict(os.environ, {'SHADYBANK_MERCHANT_SERVICE_KEY': KEY, 'SHADYBANK_MERCHANT_ACCOUNT_ID': '1',
+                                        'SHADYBANK_MERCHANT_CAPTURE_ENABLED': enabled, 'SHADYBANK_MEMBER_SERVICE_KEY': ''}):
+                MerchantAPI(SimpleNamespace(_app=app))
+            async with TestClient(TestServer(app)) as client:
+                response = await client.post('/api/merchant/capture', json={}, headers={'X-Shadybank-Merchant-Key':key})
                 self.assertEqual(response.status, expected)
 
 
@@ -57,7 +68,8 @@ class MerchantPostgresTests(unittest.IsolatedAsyncioTestCase):
                                     instrument_digest(token), merchant, card_id)
         await self.pool.execute('UPDATE merchant_instruments SET revoked_at=NOW() WHERE token_digest=$1', instrument_digest(self.revoked))
         app = web.Application()
-        with patch.dict(os.environ, {'SHADYBANK_MERCHANT_SERVICE_KEY': KEY, 'SHADYBANK_MERCHANT_ACCOUNT_ID': str(self.merchant)}):
+        with patch.dict(os.environ, {'SHADYBANK_MERCHANT_SERVICE_KEY': KEY, 'SHADYBANK_MERCHANT_ACCOUNT_ID': str(self.merchant),
+                                    'SHADYBANK_MERCHANT_CAPTURE_ENABLED': '1', 'SHADYBANK_MEMBER_SERVICE_KEY': ''}):
             MerchantAPI(SimpleNamespace(_app=app, _psql_pool=self.pool, _redis_pool=Redis()))
         self.client = TestClient(TestServer(app))
         await self.client.start_server()
@@ -74,6 +86,14 @@ class MerchantPostgresTests(unittest.IsolatedAsyncioTestCase):
 
     async def balances(self):
         row = await self.pool.fetchrow('SELECT balance,available FROM accounts WHERE id=$1', self.member)
+        return row['balance'], row['available']
+
+    async def capture(self, request_id, settlement_id, amount='12.50'):
+        return await self.client.post('/api/merchant/capture', json={'request_id': str(request_id),
+            'settlement_id': str(settlement_id), 'amount': amount}, headers={'X-Shadybank-Merchant-Key': KEY})
+
+    async def merchant_balances(self):
+        row = await self.pool.fetchrow('SELECT balance,available FROM accounts WHERE id=$1', self.merchant)
         return row['balance'], row['available']
 
     async def test_concurrent_identical_authorization_reserves_once_and_replays(self):
@@ -114,3 +134,117 @@ class MerchantPostgresTests(unittest.IsolatedAsyncioTestCase):
         await self.pool.execute(migration)
         self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM merchant_instruments'), 3)
         self.assertEqual((await (await self.authorize()).json())['status'], 'approved')
+
+    async def test_concurrent_capture_posts_once_and_replays_exact_receipt(self):
+        request_id, settlement_id = uuid4(), uuid4()
+        self.assertEqual((await (await self.authorize(request_id=request_id)).json())['status'], 'approved')
+        self.assertEqual(await self.balances(), (Decimal('100.00'), Decimal('87.50')))
+        a,b = await asyncio.gather(self.capture(request_id, settlement_id), self.capture(request_id, settlement_id))
+        self.assertEqual((a.status,b.status),(200,200))
+        expected={'status':'posted','settlement_id':str(settlement_id)}
+        self.assertEqual(await a.json(), expected)
+        self.assertEqual(await b.json(), expected)
+        self.assertEqual(await self.balances(), (Decimal('87.50'), Decimal('87.50')))
+        self.assertEqual(await self.merchant_balances(), (Decimal('12.50'), Decimal('12.50')))
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM merchant_capture_requests'),1)
+        self.assertEqual(await self.pool.fetchval("SELECT count(*) FROM transactions WHERE type='purchase' AND amount=12.50"),1)
+        self.assertEqual(await self.pool.fetchval('SELECT pan FROM transactions'),'************0001')
+        self.assertEqual((await self.capture(request_id,uuid4())).status,409)
+        self.assertEqual((await self.capture(request_id,settlement_id,'12.49')).status,409)
+        self.assertEqual(await self.balances(), (Decimal('87.50'), Decimal('87.50')))
+
+    async def test_partial_capture_releases_unused_reservation_and_rejects_invalid_amount(self):
+        request_id, settlement_id = uuid4(), uuid4()
+        await self.authorize(request_id=request_id)
+        self.assertEqual((await self.capture(request_id,settlement_id,'12.51')).status,403)
+        self.assertEqual((await self.capture(request_id,settlement_id,'0.00')).status,400)
+        self.assertEqual((await self.capture(request_id,settlement_id,'1.001')).status,400)
+        self.assertEqual((await self.capture(request_id,request_id)).status,400)
+        self.assertEqual(await self.balances(),(Decimal('100.00'),Decimal('87.50')))
+        self.assertEqual((await self.capture(request_id,settlement_id,'5.00')).status,200)
+        self.assertEqual(await self.balances(),(Decimal('95.00'),Decimal('95.00')))
+        self.assertEqual(await self.merchant_balances(),(Decimal('5.00'),Decimal('5.00')))
+
+    async def test_settlement_identifier_cannot_post_two_reservations(self):
+        first,second,settlement=uuid4(),uuid4(),uuid4()
+        await self.authorize(request_id=first,amount='5.00')
+        await self.authorize(request_id=second,amount='5.00')
+        responses=await asyncio.gather(self.capture(first,settlement,'5.00'),self.capture(second,settlement,'5.00'))
+        self.assertEqual(sorted(r.status for r in responses),[200,409])
+        self.assertEqual(await self.balances(),(Decimal('95.00'),Decimal('90.00')))
+        self.assertEqual(await self.merchant_balances(),(Decimal('5.00'),Decimal('5.00')))
+        self.assertEqual(await self.pool.fetchval("SELECT count(*) FROM authorizations WHERE status='pending'"),1)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM transactions'),1)
+
+    async def test_expired_voided_and_declined_reservations_are_not_posted(self):
+        expired,voided,declined=uuid4(),uuid4(),uuid4()
+        a=await (await self.authorize(request_id=expired,amount='5.00')).json()
+        b=await (await self.authorize(request_id=voided,amount='5.00')).json()
+        await self.authorize(request_id=declined,amount='200.00')
+        await self.pool.execute("UPDATE authorizations SET expires=NOW()-INTERVAL '1 minute' WHERE auth_code=$1",a['authorization_code'])
+        async with self.pool.acquire() as db:
+            async with db.transaction():
+                released=await db.fetchrow("UPDATE authorizations SET status='voided' WHERE auth_code=$1 AND status='pending' RETURNING debit_account,authorized_debit_amount",b['authorization_code'])
+                await db.execute('UPDATE accounts SET available=available+$1 WHERE id=$2',released['authorized_debit_amount'],released['debit_account'])
+        for request_id,expected in ((expired,409),(voided,409),(declined,404),(uuid4(),404)):
+            self.assertEqual((await self.capture(request_id,uuid4(),'5.00')).status,expected)
+        self.assertEqual(await self.balances(),(Decimal('100.00'),Decimal('95.00')))
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM transactions'),0)
+
+    async def test_existing_posted_reservation_is_not_captured_again(self):
+        request_id=uuid4()
+        decision=await (await self.authorize(request_id=request_id,amount='5.00')).json()
+        async with self.pool.acquire() as db:
+            async with db.transaction():
+                row=await lock_pending_authorization(db,self.merchant,decision['authorization_code'])
+                self.assertIsNotNone(row)
+                await post_locked_capture(db,row,Decimal('5.00'),'Manual fixture capture')
+        self.assertEqual((await self.capture(request_id,uuid4(),'5.00')).status,409)
+        self.assertEqual(await self.balances(),(Decimal('95.00'),Decimal('95.00')))
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM transactions'),1)
+
+    async def test_database_enforces_one_purchase_per_merchant_authorization(self):
+        import asyncpg
+        identity=uuid4()
+        approved=await (await self.authorize(request_id=identity,amount='5.00')).json()
+        self.assertEqual((await self.capture(identity,uuid4(),'5.00')).status,200)
+        with self.assertRaises(asyncpg.UniqueViolationError):
+            await self.pool.execute("INSERT INTO transactions(debit_account,credit_account,amount,auth_code,type) "
+                "VALUES($1,$2,5.00,$3,'purchase')",self.member,self.merchant,approved['authorization_code'])
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM transactions'),1)
+        self.assertEqual(await self.balances(),(Decimal('95.00'),Decimal('95.00')))
+        self.assertEqual(await self.merchant_balances(),(Decimal('5.00'),Decimal('5.00')))
+
+    async def test_capture_migration_keeps_prior_reservations_and_is_repeatable(self):
+        request_id=uuid4()
+        await self.authorize(request_id=request_id,amount='5.00')
+        # This is the unique disposable fixture schema, with no capture receipts yet.
+        await self.pool.execute('DROP TABLE merchant_capture_requests; DROP INDEX transactions_purchase_authorization_once')
+        migration=(Path(__file__).resolve().parents[1]/'srv/data/merchant-capture.sql').read_text()
+        await self.pool.execute(migration)
+        await self.pool.execute(migration)
+        self.assertEqual(await self.balances(),(Decimal('100.00'),Decimal('95.00')))
+        self.assertEqual((await self.capture(request_id,uuid4(),'5.00')).status,200)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM merchant_capture_requests'),1)
+
+    async def test_capture_is_scoped_to_the_same_merchant(self):
+        app=web.Application()
+        other_key='independent-synthetic-merchant-service-key'
+        with patch.dict(os.environ,{'SHADYBANK_MERCHANT_SERVICE_KEY':other_key,
+            'SHADYBANK_MERCHANT_ACCOUNT_ID':str(self.other_merchant),'SHADYBANK_MERCHANT_CAPTURE_ENABLED':'1',
+            'SHADYBANK_MEMBER_SERVICE_KEY':''}):
+            MerchantAPI(SimpleNamespace(_app=app,_psql_pool=self.pool,_redis_pool=Redis()))
+        request_id,settlement_id=uuid4(),uuid4()
+        async with TestClient(TestServer(app)) as other:
+            headers={'X-Shadybank-Merchant-Key':other_key}
+            approved=await other.post('/api/merchant/authorize',json={'instrument_token':self.other_token,
+                'request_id':str(request_id),'amount':'5.00'},headers=headers)
+            self.assertEqual((await approved.json())['status'],'approved')
+            self.assertEqual((await self.capture(request_id,settlement_id,'5.00')).status,404)
+            result=await other.post('/api/merchant/capture',json={'request_id':str(request_id),
+                'settlement_id':str(settlement_id),'amount':'5.00'},headers=headers)
+            self.assertEqual(result.status,200)
+        self.assertEqual(await self.balances(),(Decimal('95.00'),Decimal('95.00')))
+        self.assertEqual(await self.merchant_balances(),(Decimal('0.00'),Decimal('0.00')))
+        self.assertEqual(await self.pool.fetchval('SELECT balance FROM accounts WHERE id=$1',self.other_merchant),Decimal('5.00'))
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM merchant_capture_requests'),1)
