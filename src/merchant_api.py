@@ -11,6 +11,7 @@ from decimal import Decimal
 
 from aiohttp import web
 from member_api import active_card, amount_value, ordinary
+from merchant_capture import lock_pending_authorization, post_locked_capture
 
 
 TOKEN = re.compile(r'[A-Za-z0-9_-]{43}')
@@ -31,7 +32,9 @@ class MerchantAPI:
             self.key = ''
         identity = os.getenv('SHADYBANK_MERCHANT_ACCOUNT_ID', '')
         self.merchant = int(identity) if re.fullmatch(r'[1-9][0-9]{0,9}', identity) and int(identity) <= 2147483647 else None
-        daemon._app.add_routes([web.post('/api/merchant/authorize', self.authorize)])
+        self.capture_enabled = os.getenv('SHADYBANK_MERCHANT_CAPTURE_ENABLED', '') == '1'
+        daemon._app.add_routes([web.post('/api/merchant/authorize', self.authorize),
+                                web.post('/api/merchant/capture', self.capture)])
 
     def service(self, request):
         if len(self.key) < 32 or self.merchant is None:
@@ -130,3 +133,63 @@ class MerchantAPI:
                 await db.execute("UPDATE merchant_authorization_requests SET outcome='approved',auth_code=$3 WHERE merchant_account=$1 AND request_id=$2",
                                  self.merchant, request_id, code)
                 return self.result('approved', code)
+
+    async def capture(self, request):
+        self.service(request)
+        if not self.capture_enabled:
+            raise web.HTTPServiceUnavailable(text='Merchant capture unavailable')
+        await self.limit()
+        if request.content_type != 'application/json' or request.content_length is None or request.content_length > 1024:
+            raise web.HTTPBadRequest(text='Invalid capture request')
+        try:
+            body = await request.read()
+            if len(body) > 1024:
+                raise ValueError()
+            data = json.loads(body)
+            if not isinstance(data, dict) or set(data) != {'request_id', 'settlement_id', 'amount'}:
+                raise ValueError()
+            amount = amount_value(data['amount'])
+            if amount >= Decimal('50000.00'):
+                raise ValueError()
+            request_id, settlement_id = (uuid.UUID(data[name]) for name in ('request_id', 'settlement_id'))
+            if (request_id.int == 0 or settlement_id.int == 0 or request_id == settlement_id or
+                    str(request_id) != data['request_id'] or str(settlement_id) != data['settlement_id']):
+                raise ValueError()
+        except (ValueError, TypeError, AttributeError, UnicodeError):
+            raise web.HTTPBadRequest(text='Invalid capture request') from None
+
+        async with self.daemon._psql_pool.acquire() as db:
+            async with db.transaction():
+                merchant = await db.fetchrow('SELECT partner,admin,special FROM accounts WHERE id=$1', self.merchant)
+                if not merchant or not merchant['partner'] or merchant['admin'] or merchant['special']:
+                    raise web.HTTPServiceUnavailable(text='Merchant service unavailable')
+                original = await db.fetchrow(
+                    'SELECT outcome,amount,auth_code FROM merchant_authorization_requests '
+                    'WHERE merchant_account=$1 AND request_id=$2 FOR UPDATE', self.merchant, request_id)
+                if not original or original['outcome'] != 'approved':
+                    raise web.HTTPNotFound(text='Approved reservation not found')
+                prior = await db.fetchrow(
+                    'SELECT settlement_id,amount FROM merchant_capture_requests WHERE merchant_account=$1 AND request_id=$2',
+                    self.merchant, request_id)
+                if prior:
+                    if prior['settlement_id'] != settlement_id or prior['amount'] != amount:
+                        raise web.HTTPConflict(text='Reservation already has a different settlement')
+                    return web.json_response({'status': 'posted', 'settlement_id': str(settlement_id)})
+                if amount > original['amount']:
+                    raise web.HTTPForbidden(text='Amount exceeds reservation')
+                authorization = await lock_pending_authorization(db, self.merchant, original['auth_code'])
+                if not authorization:
+                    raise web.HTTPConflict(text='Reservation is no longer pending')
+                # This scoped route only posts a previously tokenized reservation.
+                if (authorization['authorized_debit_amount'] != original['amount'] or
+                        not re.fullmatch(r'\*{12}[0-9]{4}', authorization['pan'] or '')):
+                    raise web.HTTPConflict(text='Reservation cannot be posted')
+                transaction_id = await post_locked_capture(db, authorization, amount, 'Scoped merchant capture')
+                inserted = await db.fetchval(
+                    'INSERT INTO merchant_capture_requests(merchant_account,request_id,settlement_id,amount,transaction_id) '
+                    'VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING RETURNING settlement_id',
+                    self.merchant, request_id, settlement_id, amount, transaction_id)
+                if inserted is None:
+                    # The database transaction also rolls back balance and purchase changes.
+                    raise web.HTTPConflict(text='Settlement identifier already used')
+                return web.json_response({'status': 'posted', 'settlement_id': str(settlement_id)})

@@ -25,6 +25,9 @@ description text, constraint transaction_description_no_track check (description
 constraint fk_debit_aid foreign key (debit_account) references accounts(id),
 constraint fk_credit_aid foreign key (credit_account) references accounts(id));
 
+CREATE UNIQUE INDEX IF NOT EXISTS transactions_purchase_authorization_once
+    ON transactions(credit_account,auth_code) WHERE type='purchase' AND auth_code IS NOT NULL;
+
 create table member_transfers (
     sender_account integer not null references accounts(id),
     request_id uuid not null,
@@ -76,4 +79,17 @@ CREATE TABLE IF NOT EXISTS merchant_authorization_requests (
     PRIMARY KEY (merchant_account, request_id),
     CHECK ((outcome = 'approved') = (auth_code IS NOT NULL)),
     FOREIGN KEY (merchant_account, auth_code) REFERENCES authorizations(credit_account, auth_code)
+);
+
+CREATE TABLE IF NOT EXISTS merchant_capture_requests (
+    merchant_account integer NOT NULL,
+    request_id uuid NOT NULL,
+    settlement_id uuid NOT NULL,
+    amount numeric(8,2) NOT NULL CHECK (amount > 0),
+    transaction_id integer NOT NULL UNIQUE REFERENCES transactions(id),
+    created_at timestamp NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (merchant_account, request_id),
+    UNIQUE (merchant_account, settlement_id),
+    CHECK (request_id <> settlement_id),
+    FOREIGN KEY (merchant_account, request_id) REFERENCES merchant_authorization_requests(merchant_account, request_id)
 );
