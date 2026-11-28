@@ -150,24 +150,8 @@ class ShadyBucksAPIDaemon:
         raise web.HTTPUnauthorized()
 
     def _append_luhn_check_digit(self, payload):
-        """Computes and appends the missing Luhn check digit for a given payload string."""
-        # Reverse payload because Luhn operates from right to left
-        digits = [int(d) for d in reversed(payload)]
-        
-        total_sum = 0
-        for i, digit in enumerate(digits):
-            # Since the check digit will be at index 0 of the final number,
-            # the payload's rightmost digit becomes the first doubled digit (index 0 here)
-            if i % 2 == 0:
-                doubled = digit * 2
-                # Subtract 9 if the doubled number is greater than 9
-                total_sum += doubled if doubled < 10 else doubled - 9
-            else:
-                total_sum += digit
-                
-        # Calculate the digit needed to make the total sum a multiple of 10
-        luhn_check_digit = (10 - (total_sum % 10)) % 10
-        return payload + str(luhn_check_digit)
+        from virtual_card_identifier import append_luhn_check_digit
+        return append_luhn_check_digit(payload)
 
     async def post_saml_new_acct(self, request):
         customer_id = await self._get_saml_customer(request)

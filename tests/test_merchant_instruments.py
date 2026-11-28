@@ -15,6 +15,10 @@ from aiohttp.test_utils import TestClient, TestServer
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
 from merchant_api import MerchantAPI, instrument_digest
 from merchant_capture import lock_pending_authorization, post_locked_capture
+from lab_issuer_ledger import CASES, seed_catalogue
+from pin_credentials import verify_pin
+from provision_member_pin import provision_on_connection as assign_member_pin
+from provision_merchant_instrument import provision_on_connection as assign_merchant_token
 
 
 KEY = 'synthetic-merchant-service-key-for-tests-only'
@@ -46,6 +50,16 @@ class MerchantConfigurationTests(unittest.IsolatedAsyncioTestCase):
                 response = await client.post('/api/merchant/capture', json={}, headers={'X-Shadybank-Merchant-Key':key})
                 self.assertEqual(response.status, expected)
 
+    async def test_terminal_reports_require_independent_opt_in_and_merchant_authentication(self):
+        for enabled, key, expected in (('0', KEY, 503), ('1', 'wrong', 401)):
+            app = web.Application()
+            with patch.dict(os.environ, {'SHADYBANK_MERCHANT_SERVICE_KEY': KEY, 'SHADYBANK_MERCHANT_ACCOUNT_ID': '1',
+                                        'SHADYBANK_MERCHANT_TERMINAL_REPORTS_ENABLED': enabled, 'SHADYBANK_MEMBER_SERVICE_KEY': ''}):
+                MerchantAPI(SimpleNamespace(_app=app))
+            async with TestClient(TestServer(app)) as client:
+                response = await client.post('/api/merchant/terminal-report', json={}, headers={'X-Shadybank-Merchant-Key':key})
+                self.assertEqual(response.status, expected)
+
 
 @unittest.skipUnless(os.getenv('SHADYBANK_TEST_DSN'), 'Dedicated PostgreSQL DSN required')
 class MerchantPostgresTests(unittest.IsolatedAsyncioTestCase):
@@ -69,7 +83,8 @@ class MerchantPostgresTests(unittest.IsolatedAsyncioTestCase):
         await self.pool.execute('UPDATE merchant_instruments SET revoked_at=NOW() WHERE token_digest=$1', instrument_digest(self.revoked))
         app = web.Application()
         with patch.dict(os.environ, {'SHADYBANK_MERCHANT_SERVICE_KEY': KEY, 'SHADYBANK_MERCHANT_ACCOUNT_ID': str(self.merchant),
-                                    'SHADYBANK_MERCHANT_CAPTURE_ENABLED': '1', 'SHADYBANK_MEMBER_SERVICE_KEY': ''}):
+                                    'SHADYBANK_MERCHANT_CAPTURE_ENABLED': '1', 'SHADYBANK_MERCHANT_TERMINAL_REPORTS_ENABLED': '1',
+                                    'SHADYBANK_MEMBER_SERVICE_KEY': ''}):
             MerchantAPI(SimpleNamespace(_app=app, _psql_pool=self.pool, _redis_pool=Redis()))
         self.client = TestClient(TestServer(app))
         await self.client.start_server()
@@ -95,6 +110,129 @@ class MerchantPostgresTests(unittest.IsolatedAsyncioTestCase):
     async def merchant_balances(self):
         row = await self.pool.fetchrow('SELECT balance,available FROM accounts WHERE id=$1', self.merchant)
         return row['balance'], row['available']
+
+    async def report(self, report_id, request_id, settlement_id, amount='12.50'):
+        return await self.client.post('/api/merchant/terminal-report', json={'report_id': str(report_id),
+            'request_id': str(request_id), 'settlement_id': str(settlement_id), 'amount': amount},
+            headers={'X-Shadybank-Merchant-Key': KEY})
+
+    async def test_early_report_and_repeated_capture_reconcile_one_debit(self):
+        request_id, settlement_id, report_id = uuid4(), uuid4(), uuid4()
+        self.assertEqual((await (await self.authorize(request_id=request_id)).json())['status'], 'approved')
+        a, b = await asyncio.gather(self.report(report_id, request_id, settlement_id),
+                                    self.report(report_id, request_id, settlement_id))
+        self.assertEqual((a.status, b.status), (200, 200))
+        self.assertEqual(await a.json(), await b.json())
+        self.assertEqual(await self.balances(), (Decimal('100.00'), Decimal('87.50')))
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM transactions'), 0)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM merchant_terminal_reports'), 1)
+        self.assertEqual((await self.capture(request_id, settlement_id, '12.00')).status, 409)
+        c, d = await asyncio.gather(self.capture(request_id, settlement_id), self.capture(request_id, settlement_id))
+        self.assertEqual((c.status, d.status), (200, 200))
+        self.assertEqual(await c.json(), await d.json())
+        observed = await self.report(report_id, request_id, settlement_id)
+        self.assertEqual(await observed.json(), {'status': 'reconciled', 'report_id': str(report_id)})
+        self.assertEqual(await self.balances(), (Decimal('87.50'), Decimal('87.50')))
+        self.assertEqual(await self.merchant_balances(), (Decimal('12.50'), Decimal('12.50')))
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM transactions'), 1)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM merchant_capture_requests'), 1)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM merchant_terminal_reports'), 1)
+        self.assertEqual((await self.report(uuid4(), request_id, settlement_id)).status, 409)
+        self.assertEqual((await self.report(report_id, request_id, settlement_id, '12.00')).status, 409)
+
+    async def test_late_report_must_match_receipt_and_cannot_debit(self):
+        request_id, settlement_id, report_id = uuid4(), uuid4(), uuid4()
+        self.assertEqual((await self.report(report_id, request_id, settlement_id)).status, 404)
+        self.assertEqual((await (await self.authorize(request_id=request_id)).json())['status'], 'approved')
+        self.assertEqual((await self.capture(request_id, settlement_id, '5.00')).status, 200)
+        self.assertEqual((await self.report(report_id, request_id, settlement_id, '12.50')).status, 409)
+        self.assertEqual((await self.report(report_id, request_id, uuid4(), '5.00')).status, 409)
+        response = await self.report(report_id, request_id, settlement_id, '5.00')
+        self.assertEqual(await response.json(), {'status': 'reconciled', 'report_id': str(report_id)})
+        self.assertEqual(await self.balances(), (Decimal('95.00'), Decimal('95.00')))
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM transactions'), 1)
+        migration = (Path(__file__).resolve().parents[1] / 'srv/data/merchant-terminal-reports.sql').read_text()
+        await self.pool.execute(migration)
+        await self.pool.execute(migration)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM merchant_terminal_reports'), 1)
+
+    async def test_report_after_expiry_retains_evidence_without_implying_a_pending_capture(self):
+        request_id, settlement_id, report_id = uuid4(), uuid4(), uuid4()
+        self.assertEqual((await (await self.authorize(request_id=request_id)).json())['status'], 'approved')
+        await self.pool.execute("UPDATE authorizations SET expires=NOW()-INTERVAL '1 minute'")
+        response = await self.report(report_id, request_id, settlement_id)
+        self.assertEqual(await response.json(), {'status': 'unresolved', 'report_id': str(report_id)})
+        self.assertEqual((await self.capture(request_id, settlement_id)).status, 409)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM transactions'), 0)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM merchant_terminal_reports'), 1)
+
+    async def test_lab_issuer_catalogue_is_funded_once_and_reconciles_through_existing_provisioners(self):
+        funding = await self.pool.fetchval(
+            "INSERT INTO accounts(name,balance,available,special) VALUES('Synthetic funding',100,100,true) RETURNING id")
+        async def seed():
+            async with self.pool.acquire() as db:
+                return await seed_catalogue(db, 'issuer-test', funding)
+        first, repeated = await asyncio.gather(seed(), seed())
+        self.assertEqual(first, repeated)
+        rows = {row['case_name']: row for row in first}
+        self.assertEqual({name: row['balance'] for name, row in rows.items()}, CASES)
+        self.assertEqual(len({row['card_id'] for row in first}), 5)
+        self.assertIsNone(rows['unlinked']['lab_reference'])
+        self.assertEqual(len({row['lab_reference'] for row in first if row['lab_reference']}), 4)
+        self.assertEqual(await self.pool.fetchval('SELECT balance FROM accounts WHERE id=$1', funding), Decimal('13.75'))
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM transactions'), 4)
+        self.assertEqual(await self.pool.fetchval(
+            'SELECT count(*) FROM cards c JOIN lab_issuer_instruments i ON i.card_id=c.merchant_instrument_id '
+            'WHERE c.dd1 IS NOT NULL OR c.dd2 IS NOT NULL'), 0)
+        pin = f'{secrets.randbelow(1000000):06d}'
+        async with self.pool.acquire() as db:
+            await assign_member_pin(db, pin, card_id=rows['mid']['card_id'])
+            mid = await assign_merchant_token(db, self.merchant, card_id=rows['mid']['card_id'])
+            low = await assign_merchant_token(db, self.merchant, card_id=rows['low']['card_id'])
+            zero = await assign_merchant_token(db, self.merchant, card_id=rows['zero']['card_id'])
+        digest = await self.pool.fetchval("SELECT secret FROM secrets WHERE type='pin' AND account_id=$1", rows['mid']['account_id'])
+        self.assertNotEqual(digest, pin)
+        self.assertTrue(verify_pin(pin, digest))
+        for token in (low, zero):
+            self.assertEqual((await (await self.authorize(token=token, amount='0.25')).json())['status'], 'declined')
+        request_id, settlement_id, report_id = uuid4(), uuid4(), uuid4()
+        a, b = await asyncio.gather(self.authorize(token=mid, amount='0.25', request_id=request_id),
+                                    self.authorize(token=mid, amount='0.25', request_id=request_id))
+        self.assertEqual(await a.json(), await b.json())
+        self.assertEqual(await self.pool.fetchval('SELECT balance FROM accounts WHERE id=$1', rows['mid']['account_id']), Decimal('0.50'))
+        self.assertEqual(await self.pool.fetchval('SELECT available FROM accounts WHERE id=$1', rows['mid']['account_id']), Decimal('0.25'))
+        self.assertEqual(await (await self.report(report_id, request_id, settlement_id, '0.25')).json(),
+                         {'status': 'awaiting_capture', 'report_id': str(report_id)})
+        c, d = await asyncio.gather(self.capture(request_id, settlement_id, '0.25'), self.capture(request_id, settlement_id, '0.25'))
+        self.assertEqual(await c.json(), await d.json())
+        self.assertEqual(await (await self.report(report_id, request_id, settlement_id, '0.25')).json(),
+                         {'status': 'reconciled', 'report_id': str(report_id)})
+        after = {row['case_name']: row for row in await seed()}
+        self.assertEqual(after['mid']['balance'], Decimal('0.25'))
+        self.assertEqual(after['mid']['available'], Decimal('0.25'))
+        self.assertEqual(after['mid']['card_id'], rows['mid']['card_id'])
+        self.assertEqual(after['mid']['lab_reference'], rows['mid']['lab_reference'])
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM transactions'), 5)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM merchant_capture_requests'), 1)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM merchant_terminal_reports'), 1)
+        migration = (Path(__file__).resolve().parents[1] / 'srv/data/lab-issuer-ledger.sql').read_text()
+        await self.pool.execute(migration)
+        await self.pool.execute(migration)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM lab_issuer_instruments'), 5)
+
+    async def test_lab_issuer_seed_refuses_unfunded_or_ordinary_funding_account_without_partial_rows(self):
+        insufficient = await self.pool.fetchval(
+            "INSERT INTO accounts(name,balance,available,special) VALUES('Synthetic funding',1,1,true) RETURNING id")
+        ordinary_funds = await self.pool.fetchval(
+            "INSERT INTO accounts(name,balance,available) VALUES('Ordinary fixture funding',100,100) RETURNING id")
+        async with self.pool.acquire() as db:
+            for funding in (insufficient, ordinary_funds):
+                with self.assertRaises(ValueError):
+                    await seed_catalogue(db, 'unfunded-test', funding)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM lab_issuer_instruments'), 0)
+        self.assertEqual(await self.pool.fetchval('SELECT count(*) FROM transactions'), 0)
+        self.assertEqual(await self.pool.fetchval('SELECT balance FROM accounts WHERE id=$1', insufficient), Decimal('1.00'))
+        self.assertEqual(await self.pool.fetchval('SELECT balance FROM accounts WHERE id=$1', ordinary_funds), Decimal('100.00'))
 
     async def test_concurrent_identical_authorization_reserves_once_and_replays(self):
         identity = uuid4()
