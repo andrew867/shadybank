@@ -33,8 +33,10 @@ class MerchantAPI:
         identity = os.getenv('SHADYBANK_MERCHANT_ACCOUNT_ID', '')
         self.merchant = int(identity) if re.fullmatch(r'[1-9][0-9]{0,9}', identity) and int(identity) <= 2147483647 else None
         self.capture_enabled = os.getenv('SHADYBANK_MERCHANT_CAPTURE_ENABLED', '') == '1'
+        self.reports_enabled = os.getenv('SHADYBANK_MERCHANT_TERMINAL_REPORTS_ENABLED', '') == '1'
         daemon._app.add_routes([web.post('/api/merchant/authorize', self.authorize),
-                                web.post('/api/merchant/capture', self.capture)])
+                                web.post('/api/merchant/capture', self.capture),
+                                web.post('/api/merchant/terminal-report', self.terminal_report)])
 
     def service(self, request):
         if len(self.key) < 32 or self.merchant is None:
@@ -177,6 +179,12 @@ class MerchantAPI:
                     return web.json_response({'status': 'posted', 'settlement_id': str(settlement_id)})
                 if amount > original['amount']:
                     raise web.HTTPForbidden(text='Amount exceeds reservation')
+                if self.reports_enabled:
+                    report = await db.fetchrow(
+                        'SELECT settlement_id,amount FROM merchant_terminal_reports WHERE merchant_account=$1 AND request_id=$2',
+                        self.merchant, request_id)
+                    if report and (report['settlement_id'] != settlement_id or report['amount'] != amount):
+                        raise web.HTTPConflict(text='Settlement differs from recorded terminal report')
                 authorization = await lock_pending_authorization(db, self.merchant, original['auth_code'])
                 if not authorization:
                     raise web.HTTPConflict(text='Reservation is no longer pending')
@@ -193,3 +201,64 @@ class MerchantAPI:
                     # The database transaction also rolls back balance and purchase changes.
                     raise web.HTTPConflict(text='Settlement identifier already used')
                 return web.json_response({'status': 'posted', 'settlement_id': str(settlement_id)})
+
+    async def terminal_report(self, request):
+        self.service(request)
+        if not self.reports_enabled:
+            raise web.HTTPServiceUnavailable(text='Terminal report service unavailable')
+        await self.limit()
+        if request.content_type != 'application/json' or request.content_length is None or request.content_length > 1024:
+            raise web.HTTPBadRequest(text='Invalid terminal report')
+        try:
+            body = await request.read()
+            if len(body) > 1024:
+                raise ValueError()
+            data = json.loads(body)
+            if not isinstance(data, dict) or set(data) != {'report_id', 'request_id', 'settlement_id', 'amount'}:
+                raise ValueError()
+            amount = amount_value(data['amount'])
+            if amount >= Decimal('50000.00'):
+                raise ValueError()
+            names = ('report_id', 'request_id', 'settlement_id')
+            ids = tuple(uuid.UUID(data[name]) for name in names)
+            if len(set(ids)) != 3 or any(value.int == 0 or str(value) != data[name] for name, value in zip(names, ids)):
+                raise ValueError()
+            report_id, request_id, settlement_id = ids
+        except (ValueError, TypeError, AttributeError, UnicodeError):
+            raise web.HTTPBadRequest(text='Invalid terminal report') from None
+
+        async with self.daemon._psql_pool.acquire() as db:
+            async with db.transaction():
+                merchant = await db.fetchrow('SELECT partner,admin,special FROM accounts WHERE id=$1', self.merchant)
+                if not merchant or not merchant['partner'] or merchant['admin'] or merchant['special']:
+                    raise web.HTTPServiceUnavailable(text='Terminal report service unavailable')
+                # Serialize with capture for this authorization, but never post or release funds here.
+                original = await db.fetchrow(
+                    'SELECT outcome,amount,auth_code FROM merchant_authorization_requests WHERE merchant_account=$1 AND request_id=$2 FOR UPDATE',
+                    self.merchant, request_id)
+                if not original or original['outcome'] != 'approved':
+                    raise web.HTTPNotFound(text='Approved reservation not found')
+                if amount > original['amount']:
+                    raise web.HTTPForbidden(text='Reported amount exceeds reservation')
+                capture = await db.fetchrow(
+                    'SELECT settlement_id,amount FROM merchant_capture_requests WHERE merchant_account=$1 AND request_id=$2',
+                    self.merchant, request_id)
+                if capture and (capture['settlement_id'] != settlement_id or capture['amount'] != amount):
+                    raise web.HTTPConflict(text='Report differs from posted settlement')
+                inserted = await db.fetchval(
+                    'INSERT INTO merchant_terminal_reports(merchant_account,report_id,request_id,settlement_id,amount) '
+                    'VALUES($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING RETURNING report_id',
+                    self.merchant, report_id, request_id, settlement_id, amount)
+                if inserted is None:
+                    prior = await db.fetchrow(
+                        'SELECT request_id,settlement_id,amount FROM merchant_terminal_reports WHERE merchant_account=$1 AND report_id=$2',
+                        self.merchant, report_id)
+                    if not prior or prior['request_id'] != request_id or prior['settlement_id'] != settlement_id or prior['amount'] != amount:
+                        raise web.HTTPConflict(text='Terminal report identifier already used')
+                status = 'reconciled'
+                if not capture:
+                    pending = await db.fetchval(
+                        "SELECT status='pending' AND expires>NOW() FROM authorizations WHERE credit_account=$1 AND auth_code=$2",
+                        self.merchant, original['auth_code'])
+                    status = 'awaiting_capture' if pending else 'unresolved'
+                return web.json_response({'status': status, 'report_id': str(report_id)})

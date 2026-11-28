@@ -93,3 +93,30 @@ CREATE TABLE IF NOT EXISTS merchant_capture_requests (
     CHECK (request_id <> settlement_id),
     FOREIGN KEY (merchant_account, request_id) REFERENCES merchant_authorization_requests(merchant_account, request_id)
 );
+
+CREATE TABLE IF NOT EXISTS merchant_terminal_reports (
+    merchant_account integer NOT NULL,
+    report_id uuid NOT NULL,
+    request_id uuid NOT NULL,
+    settlement_id uuid NOT NULL,
+    amount numeric(8,2) NOT NULL CHECK (amount > 0),
+    created_at timestamp NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (merchant_account, report_id),
+    UNIQUE (merchant_account, request_id),
+    UNIQUE (merchant_account, settlement_id),
+    CHECK (report_id <> request_id AND report_id <> settlement_id AND request_id <> settlement_id),
+    FOREIGN KEY (merchant_account, request_id) REFERENCES merchant_authorization_requests(merchant_account, request_id)
+);
+
+CREATE TABLE IF NOT EXISTS lab_issuer_instruments (
+    catalogue varchar(64) NOT NULL,
+    case_name varchar(16) NOT NULL CHECK (case_name IN ('full','mid','low','zero','unlinked')),
+    card_id uuid NOT NULL UNIQUE REFERENCES cards(merchant_instrument_id),
+    lab_reference uuid UNIQUE,
+    initial_amount numeric(8,2) NOT NULL CHECK (initial_amount >= 0),
+    funding_transaction_id integer UNIQUE REFERENCES transactions(id),
+    created_at timestamp NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (catalogue, case_name),
+    CHECK ((case_name = 'unlinked') = (lab_reference IS NULL)),
+    CHECK ((initial_amount = 0) = (funding_transaction_id IS NULL))
+);

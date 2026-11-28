@@ -34,4 +34,40 @@ Clients must not treat an authorization as a purchase. A terminal integration mu
 
 The disposable PostgreSQL tests verify full and partial capture, exact receipt replay under concurrency, distinct reservation and settlement constraints, rejection of invalid or expired states, the database purchase invariant and repeatable migration. This is bank service evidence, not terminal or physical payment acceptance.
 
+## Terminal report reconciliation
+
+Apply `srv/data/merchant-terminal-reports.sql` after the existing merchant capture migration, then explicitly enable `SHADYBANK_MERCHANT_TERMINAL_REPORTS_ENABLED=1` for the scoped merchant service.
+
+`POST /api/merchant/terminal-report` accepts only the merchant key and these JSON fields:
+
+| Field | Meaning |
+| --- | --- |
+| `report_id` | Stable UUID for the recognized terminal upload evidence |
+| `request_id` | Existing approved authorization UUID |
+| `settlement_id` | Independent settlement UUID used by capture |
+| `amount` | Positive fixed-point amount, no more than the reservation |
+
+The response is `awaiting_capture` while the reservation is pending, `reconciled` after a matching posted receipt exists, or `unresolved` when the reservation is no longer pending and no matching scoped receipt exists. The same report ID with unchanged details is idempotent; a changed identity or amount conflicts. A different report ID cannot create another report for the same authorization or settlement. An earlier report must agree with later capture, and a late report must agree with the existing receipt. Reports never modify balances, create purchases, reserve funds or release a reservation. The client must verify and identify the actual terminal record before submitting this minimal evidence. No card data, protected card identifiers or raw CDR fields are accepted.
+
+## Bank-side lab issuer catalogue
+
+An administrator can create a separate, internally funded catalogue for ledger acceptance tests. Apply `srv/data/lab-issuer-ledger.sql` on an existing installation; a fresh database includes the table. Run the following from the authorized bank console, replacing the funding account placeholder with an existing eligible, sufficiently funded special or administrator account:
+
+```sh
+python src/lab_issuer_ledger.py --catalogue lab-acceptance --funding-account <account-id>
+```
+
+This creates five ordinary bank-only virtual instruments with opening balances 85.20, 0.50, 0.05, 0.00 and 0.50 respectively, the last deliberately unlinked. Nonzero funding is transferred from the designated account and recorded once in the ledger. Repeating the same catalogue name returns the existing records without replenishing balances or changing identifiers. No card track or terminal authentication fields are supplied.
+
+Keep the administrator output private. It contains the case name, opaque lab reference, bank card UUID, account ID, initial amount, funding transaction ID, and current balances. The lab reference is an internal identifier, not a card number or a physical card serial. It can be used by a synthetic test client; it is not evidence of any particular terminal payment application.
+
+Assign a member PIN or a separate merchant token through the existing operator provisioning scripts using the returned bank card UUID:
+
+```sh
+python src/provision_member_pin.py --card-id <card-uuid>
+python src/provision_merchant_instrument.py --card-id <card-uuid>
+```
+
+The PIN is entered privately and stored as a salted hash. Merchant tokens are shown once and saved only as digests. These actions are never executed automatically at service startup. Terminal report reconciliation uses opaque request, settlement and report IDs, and does not establish acceptance by a physical card reader or qualify a device-specific issuer profile.
+
 Tests use dedicated synthetic instruments and a disposable PostgreSQL schema, including competing reservations and identical retries. No actual payment-network credential or protocol is required.
